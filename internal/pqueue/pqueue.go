@@ -6,7 +6,7 @@ import (
 
 type Item struct {
 	Value    interface{}
-	Priority int64
+	Priority int64 // 超时时间戳
 	Index    int
 }
 

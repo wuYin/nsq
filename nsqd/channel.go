@@ -83,6 +83,7 @@ func NewChannel(topicName string, channelName string, ctx *context,
 		ctx:            ctx,
 	}
 	// create mem-queue only if size > 0 (do not use unbuffered chan)
+	// mem-queue-size 为 0 时消息全部落盘
 	if ctx.nsqd.getOpts().MemQueueSize > 0 {
 		c.memoryMsgChan = make(chan *Message, ctx.nsqd.getOpts().MemQueueSize)
 	}
@@ -441,6 +442,7 @@ func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout tim
 }
 
 func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
+	// 延迟队列的优先级是超时时刻的时间戳
 	absTs := time.Now().Add(timeout).UnixNano()
 	item := &pqueue.Item{Value: msg, Priority: absTs}
 	err := c.pushDeferredMessage(item)
@@ -562,6 +564,8 @@ exit:
 	return dirty
 }
 
+// 将时间 t 前的队头消息放入 c
+// dirty 标识是否成功
 func (c *Channel) processInFlightQueue(t int64) bool {
 	c.exitMutex.RLock()
 	defer c.exitMutex.RUnlock()

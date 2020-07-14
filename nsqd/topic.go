@@ -110,6 +110,7 @@ func (t *Topic) GetChannel(channelName string) *Channel {
 
 	if isNew {
 		// update messagePump state
+		// 通知创建了新的 channel
 		select {
 		case t.channelUpdateChan <- 1:
 		case <-t.exitChan:
@@ -241,6 +242,7 @@ func (t *Topic) Depth() int64 {
 
 // messagePump selects over the in-memory and backend queue and
 // writes messages to every channel for this topic
+// 消息多播
 func (t *Topic) messagePump() {
 	var msg *Message
 	var buf []byte
@@ -258,7 +260,7 @@ func (t *Topic) messagePump() {
 			continue
 		case <-t.exitChan:
 			goto exit
-		case <-t.startChan:
+		case <-t.startChan: // 所有 channel 都添加完毕，才开始处理
 		}
 		break
 	}
@@ -282,7 +284,7 @@ func (t *Topic) messagePump() {
 				t.ctx.nsqd.logf(LOG_ERROR, "failed to decode message - %s", err)
 				continue
 			}
-		case <-t.channelUpdateChan:
+		case <-t.channelUpdateChan: // 增删 channel 要刷新 chans
 			chans = chans[:0]
 			t.RLock()
 			for _, c := range t.channelMap {
@@ -298,7 +300,7 @@ func (t *Topic) messagePump() {
 			}
 			continue
 		case <-t.pauseChan:
-			if len(chans) == 0 || t.IsPaused() {
+			if len(chans) == 0 || t.IsPaused() { // 清空 chan 来暂停 topic
 				memoryMsgChan = nil
 				backendChan = nil
 			} else {
@@ -310,12 +312,14 @@ func (t *Topic) messagePump() {
 			goto exit
 		}
 
+		// 多播
 		for i, channel := range chans {
 			chanMsg := msg
 			// copy the message because each channel
 			// needs a unique instance but...
 			// fastpath to avoid copy if its the first channel
 			// (the topic already created the first copy)
+			// 第一个 channel 直接用 msg 尽可能少拷贝
 			if i > 0 {
 				chanMsg = NewMessage(msg.ID, msg.Body)
 				chanMsg.Timestamp = msg.Timestamp

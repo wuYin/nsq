@@ -45,6 +45,7 @@ type NSQD struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	clientIDSequence int64
 
+	// 保护 topicMap
 	sync.RWMutex
 
 	opts atomic.Value
@@ -243,6 +244,8 @@ func (n *NSQD) RemoveClient(clientID int64) {
 	n.clientLock.Unlock()
 }
 
+// 尝试启动 nsq servers
+// TCP / HTTP / HTTPS
 func (n *NSQD) Main() error {
 	ctx := &context{n}
 
@@ -362,6 +365,8 @@ func (n *NSQD) LoadMetadata() error {
 				channel.Pause()
 			}
 		}
+
+		// 激活 topic pump
 		topic.Start()
 	}
 	return nil
@@ -593,6 +598,7 @@ func (n *NSQD) channels() []*Channel {
 //
 // 	1 <= pool <= min(num * 0.25, QueueScanWorkerPoolMax)
 //
+// 理想的 scan worker 数量：[1, min(1/4 * len(all_channels), MAX)]
 func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, closeCh chan int) {
 	idealPoolSize := int(float64(num) * 0.25)
 	if idealPoolSize < 1 {
@@ -619,6 +625,8 @@ func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, c
 
 // queueScanWorker receives work (in the form of a channel) from queueScanLoop
 // and processes the deferred and in-flight queues
+// 从 workChannel 接收要处理的 channel
+// 可通过 closeCh 关闭 worker，从而调整 pool 大小
 func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, closeCh chan int) {
 	for {
 		select {
@@ -652,12 +660,15 @@ func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, close
 // If QueueScanDirtyPercent (default: 25%) of the selected channels were dirty,
 // the loop continues without sleep.
 func (n *NSQD) queueScanLoop() {
+	//       										   --> in-flight queue -> msg
+	// topics --> channels -> workCh -> pool workers --
+	//        										   --> deferred queue  -> msg
 	workCh := make(chan *Channel, n.getOpts().QueueScanSelectionCount)
-	responseCh := make(chan bool, n.getOpts().QueueScanSelectionCount)
+	responseCh := make(chan bool, n.getOpts().QueueScanSelectionCount) // 20
 	closeCh := make(chan int)
 
-	workTicker := time.NewTicker(n.getOpts().QueueScanInterval)
-	refreshTicker := time.NewTicker(n.getOpts().QueueScanRefreshInterval)
+	workTicker := time.NewTicker(n.getOpts().QueueScanInterval) // 0.1s
+	refreshTicker := time.NewTicker(n.getOpts().QueueScanRefreshInterval) // 5s
 
 	channels := n.channels()
 	n.resizePool(len(channels), workCh, responseCh, closeCh)
@@ -682,6 +693,7 @@ func (n *NSQD) queueScanLoop() {
 		}
 
 	loop:
+		// 随机处理 channel
 		for _, i := range util.UniqRands(num, len(channels)) {
 			workCh <- channels[i]
 		}

@@ -4,6 +4,7 @@ import (
 	"math/rand"
 )
 
+// 随机 swap 打散来实现无序
 func UniqRands(quantity int, maxval int) []int {
 	if maxval < quantity {
 		quantity = maxval
