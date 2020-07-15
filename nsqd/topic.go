@@ -21,12 +21,14 @@ type Topic struct {
 
 	sync.RWMutex
 
-	name              string
-	channelMap        map[string]*Channel
-	backend           BackendQueue
-	memoryMsgChan     chan *Message
-	startChan         chan int
-	exitChan          chan int
+	name          string
+	channelMap    map[string]*Channel
+	backend       BackendQueue  // 磁盘持久化队列
+	memoryMsgChan chan *Message // 内存消息缓存
+
+	startChan chan int // 激活 pump
+	exitChan  chan int // 退出 pump
+
 	channelUpdateChan chan int
 	waitGroup         util.WaitGroupWrapper
 	exitFlag          int32
@@ -81,6 +83,9 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 		)
 	}
 
+	// 启动 topic pump
+	// 等待从 lookupd 拉取 channel
+	// 或从本地加载 channel 激活
 	t.waitGroup.Wrap(t.messagePump)
 
 	t.ctx.nsqd.Notify(t)
@@ -110,7 +115,7 @@ func (t *Topic) GetChannel(channelName string) *Channel {
 
 	if isNew {
 		// update messagePump state
-		// 通知创建了新的 channel
+		// 通知 topic 创建了新的 channel
 		select {
 		case t.channelUpdateChan <- 1:
 		case <-t.exitChan:
@@ -178,6 +183,7 @@ func (t *Topic) DeleteExistingChannel(channelName string) error {
 }
 
 // PutMessage writes a Message to the queue
+// producer --msg--> topic
 func (t *Topic) PutMessage(m *Message) error {
 	t.RLock()
 	defer t.RUnlock()
@@ -220,9 +226,9 @@ func (t *Topic) PutMessages(msgs []*Message) error {
 
 func (t *Topic) put(m *Message) error {
 	select {
-	case t.memoryMsgChan <- m:
+	case t.memoryMsgChan <- m: // 优先放内存
 	default:
-		b := bufferPoolGet()
+		b := bufferPoolGet() // 内存满才走 disk 中转
 		err := writeMessageToBackend(b, m, t.backend)
 		bufferPoolPut(b)
 		t.ctx.nsqd.SetHealth(err)
@@ -242,7 +248,7 @@ func (t *Topic) Depth() int64 {
 
 // messagePump selects over the in-memory and backend queue and
 // writes messages to every channel for this topic
-// 消息多播
+// 将消息多播到 channel 中
 func (t *Topic) messagePump() {
 	var msg *Message
 	var buf []byte
@@ -269,6 +275,7 @@ func (t *Topic) messagePump() {
 		chans = append(chans, c)
 	}
 	t.RUnlock()
+	// 有消费 channel 且 topic 未被暂停，才推送消息
 	if len(chans) > 0 && !t.IsPaused() {
 		memoryMsgChan = t.memoryMsgChan
 		backendChan = t.backend.ReadChan()
@@ -284,7 +291,7 @@ func (t *Topic) messagePump() {
 				t.ctx.nsqd.logf(LOG_ERROR, "failed to decode message - %s", err)
 				continue
 			}
-		case <-t.channelUpdateChan: // 增删 channel 要刷新 chans
+		case <-t.channelUpdateChan: // 增删订阅 channel 要刷新 chans
 			chans = chans[:0]
 			t.RLock()
 			for _, c := range t.channelMap {
@@ -300,7 +307,7 @@ func (t *Topic) messagePump() {
 			}
 			continue
 		case <-t.pauseChan:
-			if len(chans) == 0 || t.IsPaused() { // 清空 chan 来暂停 topic
+			if len(chans) == 0 || t.IsPaused() { // 清空 chan 来实现暂停
 				memoryMsgChan = nil
 				backendChan = nil
 			} else {
@@ -319,7 +326,7 @@ func (t *Topic) messagePump() {
 			// needs a unique instance but...
 			// fastpath to avoid copy if its the first channel
 			// (the topic already created the first copy)
-			// 第一个 channel 直接用 msg 尽可能少拷贝
+			// 第一个 channel 直接用 msg，尽可能少拷贝
 			if i > 0 {
 				chanMsg = NewMessage(msg.ID, msg.Body)
 				chanMsg.Timestamp = msg.Timestamp

@@ -33,6 +33,7 @@ type Consumer interface {
 //
 // Channels maintain all client and message metadata, orchestrating in-flight
 // messages, timeouts, requeuing, etc.
+// topic -> channels, channel -> clients
 type Channel struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	requeueCount uint64
@@ -42,7 +43,7 @@ type Channel struct {
 	sync.RWMutex
 
 	topicName string
-	name      string
+	name      string // 订阅组名称
 	ctx       *context
 
 	backend BackendQueue
@@ -62,15 +63,19 @@ type Channel struct {
 	e2eProcessingLatencyStream *quantile.Quantile
 
 	// TODO: these can be DRYd up
+	// 延迟消息队列
 	deferredMessages map[MessageID]*pqueue.Item
 	deferredPQ       pqueue.PriorityQueue
 	deferredMutex    sync.Mutex
+
+	// 实时消息队列
 	inFlightMessages map[MessageID]*Message
 	inFlightPQ       inFlightPqueue
 	inFlightMutex    sync.Mutex
 }
 
 // NewChannel creates a new instance of the Channel type and returns a pointer
+// 创建属于指定 topic 的 channel
 func NewChannel(topicName string, channelName string, ctx *context,
 	deleteCallback func(*Channel)) *Channel {
 
@@ -106,6 +111,7 @@ func NewChannel(topicName string, channelName string, ctx *context,
 		}
 		// backend names, for uniqueness, automatically include the topic...
 		backendName := getBackendName(topicName, channelName)
+		// 每个 channel 也有自己的 diskqueue
 		c.backend = diskqueue.New(
 			backendName,
 			ctx.nsqd.getOpts().DataPath,
@@ -564,8 +570,7 @@ exit:
 	return dirty
 }
 
-// 将时间 t 前的队头消息放入 c
-// dirty 标识是否成功
+// 下发实时队列中超时时间 < t 的所有消息
 func (c *Channel) processInFlightQueue(t int64) bool {
 	c.exitMutex.RLock()
 	defer c.exitMutex.RUnlock()
@@ -581,13 +586,13 @@ func (c *Channel) processInFlightQueue(t int64) bool {
 		c.inFlightMutex.Unlock()
 
 		if msg == nil {
-			goto exit
+			return dirty
 		}
 		dirty = true
 
 		_, err := c.popInFlightMessage(msg.clientID, msg.ID)
 		if err != nil {
-			goto exit
+			return dirty
 		}
 		atomic.AddUint64(&c.timeoutCount, 1)
 		c.RLock()
@@ -598,7 +603,4 @@ func (c *Channel) processInFlightQueue(t int64) bool {
 		}
 		c.put(msg)
 	}
-
-exit:
-	return dirty
 }

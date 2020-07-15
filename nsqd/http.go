@@ -182,6 +182,7 @@ func (s *httpServer) getTopicFromQuery(req *http.Request) (url.Values, *Topic, e
 	return reqParams, s.ctx.nsqd.GetTopic(topicName), nil
 }
 
+// 处理 HTTP Producer 消息
 func (s *httpServer) doPUB(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	// TODO: one day I'd really like to just error on chunked requests
 	// to be able to fail "too big" requests before we even read

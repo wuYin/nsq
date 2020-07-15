@@ -5,6 +5,8 @@ import (
 	"sync"
 )
 
+// 共享的 buffer pool
+// 使用前需 Reset
 var bp sync.Pool
 
 func init() {

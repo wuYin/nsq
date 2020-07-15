@@ -68,6 +68,7 @@ func (p *program) Start() error {
 	}
 	p.nsqd = nsqd
 
+	// 从 nsqd.dat 或 lookupd 中加载并实例化 <topic, channels>
 	err = p.nsqd.LoadMetadata()
 	if err != nil {
 		logFatal("failed to load metadata - %s", err)

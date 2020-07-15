@@ -245,7 +245,6 @@ func (n *NSQD) RemoveClient(clientID int64) {
 }
 
 // 尝试启动 nsq servers
-// TCP / HTTP / HTTPS
 func (n *NSQD) Main() error {
 	ctx := &context{n}
 
@@ -260,16 +259,19 @@ func (n *NSQD) Main() error {
 		})
 	}
 
+	// TCP Serve
 	n.tcpServer.ctx = ctx
 	n.waitGroup.Wrap(func() {
 		exitFunc(protocol.TCPServer(n.tcpListener, n.tcpServer, n.logf))
 	})
 
+	// HTTP Serve
 	httpServer := newHTTPServer(ctx, false, n.getOpts().TLSRequired == TLSRequired)
 	n.waitGroup.Wrap(func() {
 		exitFunc(http_api.Serve(n.httpListener, httpServer, "HTTP", n.logf))
 	})
 
+	// HTTPS Serve
 	if n.tlsConfig != nil && n.getOpts().HTTPSAddress != "" {
 		httpsServer := newHTTPServer(ctx, true, true)
 		n.waitGroup.Wrap(func() {
@@ -277,8 +279,13 @@ func (n *NSQD) Main() error {
 		})
 	}
 
+	// Topic Channel Queue Scan
 	n.waitGroup.Wrap(n.queueScanLoop)
+
+	// Lookup
 	n.waitGroup.Wrap(n.lookupLoop)
+
+	// Metrics
 	if n.getOpts().StatsdAddress != "" {
 		n.waitGroup.Wrap(n.statsdLoop)
 	}
@@ -464,6 +471,7 @@ func (n *NSQD) Exit() {
 
 // GetTopic performs a thread safe operation
 // to return a pointer to a Topic object (potentially new)
+// 创建 topic
 func (n *NSQD) GetTopic(topicName string) *Topic {
 	// most likely, we already have this topic, so try read lock first.
 	n.RLock()
@@ -555,6 +563,7 @@ func (n *NSQD) DeleteExistingTopic(topicName string) error {
 	return nil
 }
 
+// 新增 topic 或 channel 时，通知 nsqd 重新持久化 metadata
 func (n *NSQD) Notify(v interface{}) {
 	// since the in-memory metadata is incomplete,
 	// should not persist metadata while loading it.
@@ -566,6 +575,8 @@ func (n *NSQD) Notify(v interface{}) {
 		select {
 		case <-n.exitChan:
 		case n.notifyChan <- v:
+			// 启动时加载旧 topic 和 channel 不必持久化
+			// main 中 Load 完会显式调用 Persist
 			if !persist {
 				return
 			}
@@ -595,12 +606,9 @@ func (n *NSQD) channels() []*Channel {
 }
 
 // resizePool adjusts the size of the pool of queueScanWorker goroutines
-//
-// 	1 <= pool <= min(num * 0.25, QueueScanWorkerPoolMax)
-//
-// 理想的 scan worker 数量：[1, min(1/4 * len(all_channels), MAX)]
-func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, closeCh chan int) {
-	idealPoolSize := int(float64(num) * 0.25)
+// 1 <= pool <= min(num * 0.25, QueueScanWorkerPoolMax)
+func (n *NSQD) resizePool(allChanCount int, workCh chan *Channel, responseCh chan bool, closeCh chan int) {
+	idealPoolSize := int(float64(allChanCount) * 0.25)
 	if idealPoolSize < 1 {
 		idealPoolSize = 1
 	} else if idealPoolSize > n.getOpts().QueueScanWorkerPoolMax {
@@ -610,11 +618,11 @@ func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, c
 		if idealPoolSize == n.poolSize {
 			break
 		} else if idealPoolSize < n.poolSize {
-			// contract
+			// 缩容
 			closeCh <- 1
 			n.poolSize--
 		} else {
-			// expand
+			// 扩容
 			n.waitGroup.Wrap(func() {
 				n.queueScanWorker(workCh, responseCh, closeCh)
 			})
@@ -625,9 +633,10 @@ func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, c
 
 // queueScanWorker receives work (in the form of a channel) from queueScanLoop
 // and processes the deferred and in-flight queues
-// 从 workChannel 接收要处理的 channel
-// 可通过 closeCh 关闭 worker，从而调整 pool 大小
+// worker 可通过 closeCh 被外部关闭，来扩缩容 pool
 func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, closeCh chan int) {
+	// 从 workCh 读取要处理的 channel
+	// 并将该 channel 在 now 之前的所有消息分发完毕
 	for {
 		select {
 		case c := <-workCh:
@@ -659,17 +668,26 @@ func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, close
 //
 // If QueueScanDirtyPercent (default: 25%) of the selected channels were dirty,
 // the loop continues without sleep.
+
+//
+// queueScanLoop 动态管理 queueScanWorker 线程池
+// 将 channels 通过 workCh 随机分发给 worker 处理，并等待返回处理是否有效的状态
+// 若 worker 忙碌率大于 25%，则继续分发堆积的 channel，否则刷新 channels 对 pool 进行扩缩容，保证 channels 公平处理
+//
 func (n *NSQD) queueScanLoop() {
 	//       										   --> in-flight queue -> msg
 	// topics --> channels -> workCh -> pool workers --
 	//        										   --> deferred queue  -> msg
+	// 解耦 channels 和 queueScanWorkers
 	workCh := make(chan *Channel, n.getOpts().QueueScanSelectionCount)
+	// worker 汇报处理有效状态
 	responseCh := make(chan bool, n.getOpts().QueueScanSelectionCount) // 20
 	closeCh := make(chan int)
 
 	workTicker := time.NewTicker(n.getOpts().QueueScanInterval) // 0.1s
 	refreshTicker := time.NewTicker(n.getOpts().QueueScanRefreshInterval) // 5s
 
+	// 取出 nsqd 管理的所有 topic 下的所有 channel
 	channels := n.channels()
 	n.resizePool(len(channels), workCh, responseCh, closeCh)
 
@@ -680,6 +698,7 @@ func (n *NSQD) queueScanLoop() {
 				continue
 			}
 		case <-refreshTicker.C:
+			// 定时刷新 channels
 			channels = n.channels()
 			n.resizePool(len(channels), workCh, responseCh, closeCh)
 			continue
@@ -693,7 +712,7 @@ func (n *NSQD) queueScanLoop() {
 		}
 
 	loop:
-		// 随机处理 channel
+		// 随机分发 channel 给 worker 处理
 		for _, i := range util.UniqRands(num, len(channels)) {
 			workCh <- channels[i]
 		}
@@ -705,6 +724,7 @@ func (n *NSQD) queueScanLoop() {
 			}
 		}
 
+		// 若 1/4 worker 本轮都有消息要处理，则继续分发
 		if float64(numDirty)/float64(num) > n.getOpts().QueueScanDirtyPercent {
 			goto loop
 		}
